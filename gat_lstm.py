@@ -72,6 +72,27 @@ class ATGCNModel(nn.Module):
         self.lstm = TemporalLSTM()
         self.classifier = NodeClassifier()
 
+    def forward(self, x_batch, edge_index, num_nodes, edge_index_cache):
+        """Forward pass for the model. Properly structured for PyTorch."""
+        B, T, N, F = x_batch.shape
+        x_graph = x_batch.reshape(B * T, N, F)
+        x_flat = x_graph.reshape(B * T * N, F).to(edge_index.device)
+
+        edge_bt = get_batched_edge_index(
+            edge_index, num_nodes, B * T, edge_index.device, edge_index_cache
+        )
+
+        gat_out = self.encoder(x_flat, edge_bt)
+        G = gat_out.shape[-1]
+        gat_out = gat_out.reshape(B, T, N, G)
+        gat_out = gat_out.permute(0, 2, 1, 3).reshape(B * N, T, G)
+
+        lstm_out = self.lstm(gat_out)
+
+        H = lstm_out.shape[-1]
+        lstm_out = lstm_out.reshape(B, N, H)
+        return self.classifier(lstm_out)
+
 
 def get_batched_edge_index(base_edge_index, num_nodes, batch_size, device, edge_index_cache):
     if batch_size not in edge_index_cache:
@@ -82,25 +103,10 @@ def get_batched_edge_index(base_edge_index, num_nodes, batch_size, device, edge_
 
 
 def forward_logits_batch(model, x_batch, base_edge_index, num_nodes, device, edge_index_cache):
-    # x_batch: [B, T, N, F] -> encode all B*T graphs in one super-graph
-    B, T, N, F = x_batch.shape
-    x_graph = x_batch.reshape(B * T, N, F)
-    x_flat = x_graph.reshape(B * T * N, F).to(device)
-
-    edge_bt = get_batched_edge_index(
-        base_edge_index, num_nodes, B * T, device, edge_index_cache
-    )
-
-    gat_out = model.encoder(x_flat, edge_bt)  # [B*T*N, G]
-    G = gat_out.shape[-1]
-    gat_out = gat_out.reshape(B, T, N, G)
-    gat_out = gat_out.permute(0, 2, 1, 3).reshape(B * N, T, G)
-
-    lstm_out = model.lstm(gat_out)  # [B*N, H]
-    H = lstm_out.shape[-1]
-    lstm_out = lstm_out.reshape(B, N, H)
-
-    return model.classifier(lstm_out)  # [B, N, 3]
+    # x_batch: [B, T, N, F] -> use model's forward() method directly
+    x_batch = x_batch.to(device)
+    base_edge_index = base_edge_index.to(device)
+    return model(x_batch, base_edge_index, num_nodes, edge_index_cache)
 
 
 # =========================
@@ -124,6 +130,12 @@ def train_one_epoch(
     # Remove leakage feature (index 3)
     batch_x = batch_x[..., [0,1,2,4,5]]
 
+    # Shuffle training order each epoch (Bug #7)
+    num_windows = batch_x.shape[0]
+    perm = torch.randperm(num_windows)
+    batch_x = batch_x[perm]
+    batch_y = batch_y[perm]
+
     total_loss = 0.0
     total_samples = 0
 
@@ -140,6 +152,7 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Bug #3: gradient clipping
         optimizer.step()
 
         mb_size = x_mb.shape[0]
@@ -226,6 +239,19 @@ def compute_and_plot_metrics(y_true, y_pred, y_prob, model_name, output_dir="fig
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="macro", zero_division=0
     )
+    precision_w, recall_w, f1_w, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="weighted", zero_division=0
+    )
+    prec_cls, rec_cls, f1_cls, _ = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0
+    )
+    precision_w, recall_w, f1_w, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="weighted", zero_division=0
+    )
+    
+    prec_cls, rec_cls, f1_cls, _ = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0
+    )
 
     try:
         auc_macro_ovr = roc_auc_score(
@@ -289,9 +315,18 @@ def compute_and_plot_metrics(y_true, y_pred, y_prob, model_name, output_dir="fig
 
     print(f"\n{model_name} Metrics")
     print(f"Accuracy : {acc:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall   : {recall:.4f}")
-    print(f"F1 Score : {f1:.4f}")
+    print(f"")
+    print(f"Precision (macro): {precision:.4f}")
+    print(f"Recall    (macro): {recall:.4f}")
+    print(f"F1 Score  (macro): {f1:.4f}")
+    print(f"")
+    print(f"Precision (weighted): {precision_w:.4f}")
+    print(f"Recall    (weighted): {recall_w:.4f}")
+    print(f"F1 Score  (weighted): {f1_w:.4f}")
+    print(f"")
+    for i in range(num_classes):
+        print(f"Class {i} | Precision: {prec_cls[i]:.4f} | Recall: {rec_cls[i]:.4f} | F1: {f1_cls[i]:.4f}")
+    print(f"")
     if np.isnan(auc_macro_ovr):
         print("AUC/ROC  : N/A (insufficient class diversity in targets)")
     else:
@@ -333,9 +368,19 @@ if __name__ == "__main__":
     edge_index = edge_index.to(device)
 
     # =========================
-    # CLASS WEIGHTS (tuned)
+    # CLASS WEIGHTS (dynamic inverse frequency)
     # =========================
-    class_weights = torch.tensor([0.3, 0.4, 0.6], dtype=torch.float32).to(device)
+    labels_flat = y_train.view(-1).numpy()
+    class_counts = np.bincount(labels_flat, minlength=3)
+    total_samples = labels_flat.size
+    num_classes = 3
+    class_weights = torch.tensor(
+        [total_samples / (num_classes * max(count, 1)) for count in class_counts],
+        dtype=torch.float32
+    ).to(device)
+
+    print(f"Label distribution: {dict(zip(range(3), class_counts))}")
+    print(f"Computed class weights: {class_weights}")
 
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
 
@@ -345,9 +390,15 @@ if __name__ == "__main__":
     model = ATGCNModel().to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=5
+    )
     batch_size = 64
     num_nodes = X_train.shape[2]
     edge_index_cache = {}
+
+    best_val_acc = 0.0
+    best_model_path = "gat_lstm_best.pt"
 
     # =========================
     # TRAIN LOOP
@@ -376,8 +427,16 @@ if __name__ == "__main__":
             edge_index_cache,
         )
 
+        scheduler.step(acc)
+
+        if acc > best_val_acc:
+            best_val_acc = acc
+            torch.save(model.state_dict(), best_model_path)
+
         if (epoch + 1) % 5 == 0:
             print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Acc: {acc:.4f}")
+
+    model.load_state_dict(torch.load(best_model_path))
 
     # =========================
     # COMPARABLE METRICS + FIGURES (TEST SPLIT)

@@ -194,6 +194,12 @@ def compute_and_plot_metrics(y_true, y_pred, y_prob, model_name, output_dir="fig
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="macro", zero_division=0
     )
+    precision_w, recall_w, f1_w, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="weighted", zero_division=0
+    )
+    prec_cls, rec_cls, f1_cls, _ = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0
+    )
 
     try:
         auc_macro_ovr = roc_auc_score(
@@ -257,9 +263,18 @@ def compute_and_plot_metrics(y_true, y_pred, y_prob, model_name, output_dir="fig
 
     print(f"\n{model_name} Metrics")
     print(f"Accuracy : {acc:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall   : {recall:.4f}")
-    print(f"F1 Score : {f1:.4f}")
+    print()
+    print(f"Precision (macro): {precision:.4f}")
+    print(f"Recall    (macro): {recall:.4f}")
+    print(f"F1 Score  (macro): {f1:.4f}")
+    print()
+    print(f"Precision (weighted): {precision_w:.4f}")
+    print(f"Recall    (weighted): {recall_w:.4f}")
+    print(f"F1 Score  (weighted): {f1_w:.4f}")
+    print()
+    for i in range(num_classes):
+        print(f"  Class {i} | Prec: {prec_cls[i]:.4f} | Rec: {rec_cls[i]:.4f} | F1: {f1_cls[i]:.4f}")
+    print()
     if np.isnan(auc_macro_ovr):
         print("AUC/ROC  : N/A (insufficient class diversity in targets)")
     else:
@@ -300,16 +315,19 @@ if __name__ == "__main__":
     X_test  = X_test[..., [0,1,2,4,5]]
 
     # =========================
-    # CLASS WEIGHTS
+    # CLASS WEIGHTS (dynamic inverse frequency - Bug #2 fix)
     # =========================
     labels_flat = y_train.view(-1).numpy()
-    class_counts = np.bincount(labels_flat)
+    class_counts = np.bincount(labels_flat, minlength=3)
+    total_samples = labels_flat.size
+    num_classes = 3
+    class_weights = torch.tensor(
+        [total_samples / (num_classes * max(count, 1)) for count in class_counts],
+        dtype=torch.float32
+    ).to(device)
 
-    class_weights = torch.tensor([0.3, 0.4, 0.6], dtype=torch.float32).to(device)
-    
-
-    print("Class counts:", class_counts)
-    print("Class weights:", class_weights)
+    print(f"Label distribution: {dict(zip(range(3), class_counts))}")
+    print(f"Computed class weights: {class_weights}")
 
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
 

@@ -95,6 +95,33 @@ class ATGCNModel(nn.Module):
         self.dropout = nn.Dropout(0.1)
         self.classifier = NodeClassifier()
 
+    def forward(self, x_batch, edge_index, num_nodes, edge_index_cache):
+        """Forward pass for the model. Properly structured for PyTorch."""
+        B, T, N, F = x_batch.shape
+        x_graph = x_batch.reshape(B * T, N, F)
+        x_flat = x_graph.reshape(B * T * N, F).to(edge_index.device)
+
+        edge_bt = get_batched_edge_index(
+            edge_index, num_nodes, B * T, edge_index.device, edge_index_cache
+        )
+
+        gat_out = self.encoder(x_flat, edge_bt)
+        G = gat_out.shape[-1]
+        gat_out = gat_out.reshape(B, T, N, G)
+        gat_out = gat_out.permute(0, 2, 1, 3).reshape(B * N, T, G)
+
+        lstm_out = self.lstm(gat_out)
+        lstm_out = self.lstm_norm(lstm_out)
+
+        attn_context = self.attn(lstm_out)
+        context = lstm_out[:, -1, :] + attn_context
+        context = self.attn_norm(context)
+        context = self.dropout(context)
+
+        H = context.shape[-1]
+        context = context.reshape(B, N, H)
+        return self.classifier(context)
+
 
 def get_batched_edge_index(base_edge_index, num_nodes, batch_size, device, edge_index_cache):
     if batch_size not in edge_index_cache:
@@ -105,31 +132,10 @@ def get_batched_edge_index(base_edge_index, num_nodes, batch_size, device, edge_
 
 
 def forward_logits_batch(model, x_batch, base_edge_index, num_nodes, device, edge_index_cache):
-    # x_batch: [B, T, N, F] -> encode all B*T graphs in one disconnected super-graph
-    B, T, N, F = x_batch.shape
-    x_graph = x_batch.reshape(B * T, N, F)
-    x_flat = x_graph.reshape(B * T * N, F).to(device)
-
-    edge_bt = get_batched_edge_index(
-        base_edge_index, num_nodes, B * T, device, edge_index_cache
-    )
-
-    gat_out = model.encoder(x_flat, edge_bt)  # [B*T*N, G]
-    G = gat_out.shape[-1]
-    gat_out = gat_out.reshape(B, T, N, G)
-    gat_out = gat_out.permute(0, 2, 1, 3).reshape(B * N, T, G)
-
-    lstm_out = model.lstm(gat_out)            # [B*N, T, H]
-    lstm_out = model.lstm_norm(lstm_out)
-
-    attn_context = model.attn(lstm_out)       # [B*N, H]
-    context = lstm_out[:, -1, :] + attn_context
-    context = model.attn_norm(context)
-    context = model.dropout(context)
-
-    H = context.shape[-1]
-    context = context.reshape(B, N, H)
-    return model.classifier(context)          # [B, N, 3]
+    # x_batch: [B, T, N, F] -> use model's forward() method directly
+    x_batch = x_batch.to(device)
+    base_edge_index = base_edge_index.to(device)
+    return model(x_batch, base_edge_index, num_nodes, edge_index_cache)
 
 
 # =========================
