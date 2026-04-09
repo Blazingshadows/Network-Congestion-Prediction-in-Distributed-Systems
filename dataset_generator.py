@@ -280,14 +280,17 @@ def compute_features(effective_load, capacity_mbps=LINK_CAPACITY_MBPS,
 # 6. FEATURE NORMALISATION
 # ---------------------------------------------------------------------------
 
-def normalize_features(features):
+def normalize_features(features, feat_min=None, feat_max=None):
     """
-    Min-max normalise each feature independently across all timesteps
-    and nodes, scaling each to [0, 1].
+    Min-max normalise each feature independently, scaling each to [0, 1].
 
     Parameters
     ----------
-    features : np.ndarray, shape [T, N, F]
+    features : np.ndarray, shape [..., F]
+    feat_min : np.ndarray, shape [F,], optional
+        Precomputed feature-wise mins to reuse (e.g., train split stats).
+    feat_max : np.ndarray, shape [F,], optional
+        Precomputed feature-wise maxes to reuse (e.g., train split stats).
 
     Returns
     -------
@@ -295,16 +298,17 @@ def normalize_features(features):
     feat_min      : np.ndarray, shape [F,]  — for inverse transform
     feat_max      : np.ndarray, shape [F,]  — for inverse transform
     """
-    T, N, F = features.shape
-    flat = features.reshape(-1, F)  # [T*N, F]
+    F = features.shape[-1]
+    flat = features.reshape(-1, F)
 
-    feat_min = flat.min(axis=0)     # [F]
-    feat_max = flat.max(axis=0)     # [F]
+    if feat_min is None or feat_max is None:
+        feat_min = flat.min(axis=0)
+        feat_max = flat.max(axis=0)
 
     denom = np.where((feat_max - feat_min) == 0, 1, feat_max - feat_min)
     norm_flat = (flat - feat_min) / denom
 
-    norm_features = norm_flat.reshape(T, N, F).astype(np.float32)
+    norm_features = norm_flat.reshape(features.shape).astype(np.float32)
     return norm_features, feat_min, feat_max
 
 
@@ -379,10 +383,10 @@ def create_windows(features, labels, window_size=WINDOW_SIZE):
 # 9. MAIN GENERATION FUNCTION
 # ---------------------------------------------------------------------------
 
-def generate_dataset(T=1000, window_size=WINDOW_SIZE, seed=42, verbose=True):
+def generate_dataset(T=1000, window_size=WINDOW_SIZE, seed=42, train_ratio=0.7, val_ratio=0.15, verbose=True):
     """
     Full pipeline: topology → traffic → propagation → features →
-                   normalisation → labels → windows.
+                   labels → windows → train-only normalisation.
 
     Parameters
     ----------
@@ -428,30 +432,36 @@ def generate_dataset(T=1000, window_size=WINDOW_SIZE, seed=42, verbose=True):
     if verbose:
         print(f"[4] Raw features   : shape {features.shape}")
 
-    # Step 5: Normalisation
-    norm_features, feat_min, feat_max = normalize_features(features)
-    if verbose:
-        print(f"[5] Norm features  : shape {norm_features.shape}, "
-              f"range [{norm_features.min():.2f}, {norm_features.max():.2f}]")
-
-    # Step 6: Labels
+    # Step 5: Labels
     labels = generate_labels(effective_load)
     unique, counts = np.unique(labels, return_counts=True)
     label_names = {0: "Normal", 1: "Warning", 2: "Congested"}
     if verbose:
-        print(f"[6] Labels         : shape {labels.shape}")
+        print(f"[5] Labels         : shape {labels.shape}")
         for u, c in zip(unique, counts):
             pct = 100 * c / labels.size
             print(f"      {label_names[u]:>10} ({u}): "
                   f"{c:6d} samples ({pct:.1f}%)")
 
-    # Step 7: Sliding windows
-    windows, targets = create_windows(norm_features, labels, window_size)
+    # Step 6: Sliding windows from raw (unnormalized) features
+    windows_raw, targets = create_windows(features, labels, window_size)
+
+    # Step 7: Fit normalization stats on train windows only, then apply globally.
+    # This avoids leaking future/test distribution into scaling.
+    n = len(windows_raw)
+    train_end = int(n * train_ratio)
+    _ = int(n * (train_ratio + val_ratio))  # kept for consistency with split definition
+
+    train_windows_raw = windows_raw[:train_end]
+    _, feat_min, feat_max = normalize_features(train_windows_raw)
+    windows, _, _ = normalize_features(windows_raw, feat_min=feat_min, feat_max=feat_max)
+
     if verbose:
-        print(f"[7] Windows        : {windows.shape}  "
+        print(f"[6] Windows        : {windows.shape}  "
               f"(num_windows, W, N, F)")
         print(f"    Targets        : {targets.shape}  "
               f"(num_windows, N)")
+        print(f"[7] Norm (train-fit): range [{windows.min():.2f}, {windows.max():.2f}]")
         print("=" * 55)
 
     return windows, targets, adj, feat_min, feat_max

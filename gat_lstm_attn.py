@@ -23,7 +23,7 @@ from sklearn.preprocessing import label_binarize
 # GAT ENCODER
 # =========================
 class GATEncoder(nn.Module):
-    def __init__(self, in_dim=5, hidden_dim=32, out_dim=32, heads=4):
+    def __init__(self, in_dim=5, hidden_dim=64, out_dim=64, heads=4):
         super().__init__()
         self.gat1 = GATConv(in_dim, hidden_dim, heads=heads)
         self.gat2 = GATConv(hidden_dim * heads, out_dim, heads=1)
@@ -39,7 +39,7 @@ class GATEncoder(nn.Module):
 # LSTM
 # =========================
 class TemporalLSTM(nn.Module):
-    def __init__(self, input_dim=32, hidden_dim=32):
+    def __init__(self, input_dim=64, hidden_dim=64):
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
 
@@ -52,7 +52,7 @@ class TemporalLSTM(nn.Module):
 # MULTI-HEAD SELF-ATTENTION
 # =========================
 class TemporalSelfAttention(nn.Module):
-    def __init__(self, hidden_dim=32, num_heads=4, dropout=0.1):
+    def __init__(self, hidden_dim=64, num_heads=4, dropout=0.1):
         super().__init__()
         self.attn = nn.MultiheadAttention(
             embed_dim=hidden_dim,
@@ -60,11 +60,11 @@ class TemporalSelfAttention(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        self.global_query = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, x):
-        batch_size = x.shape[0]
-        query = self.global_query.expand(batch_size, -1, -1)
+        # Node-conditioned query from each node's final hidden state.
+        query = self.query_proj(x[:, -1:, :])
         attn_out, _ = self.attn(query, x, x, need_weights=False)
         return attn_out.squeeze(1)
 
@@ -73,7 +73,7 @@ class TemporalSelfAttention(nn.Module):
 # CLASSIFIER
 # =========================
 class NodeClassifier(nn.Module):
-    def __init__(self, in_dim=32, num_classes=3):
+    def __init__(self, in_dim=64, num_classes=3):
         super().__init__()
         self.fc = nn.Linear(in_dim, num_classes)
 
@@ -87,13 +87,13 @@ class NodeClassifier(nn.Module):
 class ATGCNModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = GATEncoder()
-        self.lstm = TemporalLSTM()
-        self.lstm_norm = nn.LayerNorm(32)
-        self.attn = TemporalSelfAttention(hidden_dim=32, num_heads=4, dropout=0.1)
-        self.attn_norm = nn.LayerNorm(32)
+        self.encoder = GATEncoder(in_dim=5, hidden_dim=64, out_dim=64, heads=4)
+        self.lstm = TemporalLSTM(input_dim=64, hidden_dim=64)
+        self.lstm_norm = nn.LayerNorm(64)
+        self.attn = TemporalSelfAttention(hidden_dim=64, num_heads=4, dropout=0.1)
+        self.attn_norm = nn.LayerNorm(64)
         self.dropout = nn.Dropout(0.1)
-        self.classifier = NodeClassifier()
+        self.classifier = NodeClassifier(in_dim=64, num_classes=3)
 
     def forward(self, x_batch, edge_index, num_nodes, edge_index_cache):
         """Forward pass for the model. Properly structured for PyTorch."""
@@ -156,6 +156,12 @@ def train_one_epoch(
 
     model.train()
 
+    # Shuffle training order each epoch.
+    num_windows = batch_x.shape[0]
+    perm = torch.randperm(num_windows)
+    batch_x = batch_x[perm]
+    batch_y = batch_y[perm]
+
     batch_x = batch_x[..., [0,1,2,4,5]]  # remove leakage
 
     total_loss = 0.0
@@ -174,6 +180,7 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         mb_size = x_mb.shape[0]
@@ -258,6 +265,12 @@ def compute_and_plot_metrics(y_true, y_pred, y_prob, model_name, output_dir="fig
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="macro", zero_division=0
     )
+    precision_w, recall_w, f1_w, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="weighted", zero_division=0
+    )
+    prec_cls, rec_cls, f1_cls, _ = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0
+    )
 
     try:
         auc_macro_ovr = roc_auc_score(
@@ -321,9 +334,18 @@ def compute_and_plot_metrics(y_true, y_pred, y_prob, model_name, output_dir="fig
 
     print(f"\n{model_name} Metrics")
     print(f"Accuracy : {acc:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall   : {recall:.4f}")
-    print(f"F1 Score : {f1:.4f}")
+    print()
+    print(f"Precision (macro): {precision:.4f}")
+    print(f"Recall    (macro): {recall:.4f}")
+    print(f"F1 Score  (macro): {f1:.4f}")
+    print()
+    print(f"Precision (weighted): {precision_w:.4f}")
+    print(f"Recall    (weighted): {recall_w:.4f}")
+    print(f"F1 Score  (weighted): {f1_w:.4f}")
+    print()
+    for i in range(num_classes):
+        print(f"  Class {i} | Prec: {prec_cls[i]:.4f} | Rec: {rec_cls[i]:.4f} | F1: {f1_cls[i]:.4f}")
+    print()
     if np.isnan(auc_macro_ovr):
         print("AUC/ROC  : N/A (insufficient class diversity in targets)")
     else:
@@ -353,14 +375,30 @@ if __name__ == "__main__":
     edge_index, _ = add_self_loops(edge_index)
     edge_index = edge_index.to(device)
 
-    class_weights = torch.tensor([0.3, 0.4, 0.6], dtype=torch.float32).to(device)
+    labels_flat = y_train.view(-1).numpy()
+    class_counts = np.bincount(labels_flat, minlength=3)
+    total_samples = labels_flat.size
+    num_classes = 3
+    class_weights = torch.tensor(
+        [total_samples / (num_classes * max(count, 1)) for count in class_counts],
+        dtype=torch.float32,
+    ).to(device)
+
+    print(f"Label distribution: {dict(zip(range(3), class_counts))}")
+    print(f"Computed class weights: {class_weights}")
+
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
 
     model = ATGCNModel().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=5
+    )
     batch_size = 64
     num_nodes = X_train.shape[2]
     edge_index_cache = {}
+    best_val_acc = 0.0
+    best_model_path = "gat_lstm_attn_best.pt"
 
     for epoch in range(70):
         loss = train_one_epoch(
@@ -386,8 +424,16 @@ if __name__ == "__main__":
             edge_index_cache,
         )
 
+        scheduler.step(acc)
+
+        if acc > best_val_acc:
+            best_val_acc = acc
+            torch.save(model.state_dict(), best_model_path)
+
         if (epoch + 1) % 5 == 0:
             print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Acc: {acc:.4f}")
+
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
 
     y_true, y_pred, y_prob = collect_predictions(
         model,
